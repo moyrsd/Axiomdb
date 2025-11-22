@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "hnswlib>=0.8.0",
+    "numba>=0.62.1",
     "orjson>=3.11.4",
     "pymupdf>=1.26.6",
+    "pytest>=9.0.1",
     "sentence-transformers>=5.1.2",
 ]
