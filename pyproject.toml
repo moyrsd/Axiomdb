@@ -1,0 +1,12 @@
+[project]
+name = "axiomdb"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "hnswlib>=0.8.0",
+    "orjson>=3.11.4",
+    "pymupdf>=1.26.6",
+    "sentence-transformers>=5.1.2",
+]
