@@ -1,142 +1,138 @@
+import regex as re
+import json
 from typing import List, Dict, Tuple
-import numpy as np
-from collections import Counter
-import numba as nb
-
+from collections import defaultdict
 from .base import BaseTokenizer
 
 
-@nb.njit
-def _apply_merge_numba(arr, p1, p2, new_id):
-    """
-    Scan arr (1D int64) and replace occurrences of (p1,p2) with new_id.
-    Returns a new array (int64) with merges applied.
-    """
-    n = arr.shape[0]
-    out = np.empty(n, dtype=np.int64)
-    oi = 0
-    i = 0
-    while i < n:
-        if i < n - 1 and arr[i] == p1 and arr[i+1] == p2:
-            out[oi] = new_id
-            oi += 1
-            i += 2
-        else:
-            out[oi] = arr[i]
-            oi += 1
-            i += 1
-    return out[:oi]
-
-
-def _apply_merges_seq(arr: np.ndarray, merges: List[Tuple[int,int,int]]) -> np.ndarray:
-    """
-    merges: list of (p1, p2, new_id) in the order they should be applied.
-    arr: numpy array of dtype np.int64
-    """
-    cur = arr
-    for (p1, p2, new_id) in merges:
-        cur = _apply_merge_numba(cur, p1, p2, new_id)
-    return cur
-
+GPT4_SPLIT_PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
 class CustomBPETokenizer(BaseTokenizer):
-    """
-    Byte-level BPE tokenizer with Numba-accelerated merge application.
-
-    Key properties:
-      - base vocab: 0..255 (single bytes)
-      - merges: dict mapping (p1,p2) -> new_id
-      - vocab: dict mapping id -> bytes sequence (used for decode)
-    """
-
     def __init__(self):
-        self.merges: Dict[Tuple[int,int], int] = {}
-        self._merges_seq: List[Tuple[int,int,int]] = []
-        self.vocab: Dict[int, bytes] = {i: bytes([i]) for i in range(256)}
-        self._next_id = 256
+        self.merges: Dict[Tuple[int, int], int] = {}
+        self.vocab: Dict[int, bytes] = {}
+        self.special_tokens: Dict[str, int] = {}
+        self.vocab_size_val = 256
+        
+        # Initialize base vocabulary (0-255)
+        for i in range(256):
+            self.vocab[i] = bytes([i])
 
-    def train(self, text: str, num_merges: int = 1000, verbose: bool = False) -> None:
+    def train(self, text: str, vocab_size: int = 30000, verbose: bool = True):
         """
-        Train merges on the provided corpus text.
-        This function:
-          - converts corpus to byte sequence (utf-8)
-          - finds most frequent adjacent byte-pair
-          - applies the pair merge to the corpus sequence (in Python using numba-accelerated merge application)
-          - repeats for num_merges
+        Trains the BPE tokenizer on the provided text corpus.
+        This is the pure Python implementation (slow).
         """
-        data_bytes = text.encode("utf-8")
-        arr = np.frombuffer(data_bytes, dtype=np.uint8).astype(np.int64)
+        print(f"Training BPE Tokenizer on {len(text)} characters...")
+        
+        compiled_pattern = re.compile(GPT4_SPLIT_PATTERN)
+        text_chunks = re.findall(compiled_pattern, text)
+        
+        ids_list = [list(chunk.encode("utf-8")) for chunk in text_chunks]
+        
+        num_merges = vocab_size - 256
+        for i in range(num_merges):
+            stats = defaultdict(int)
+            
+            for chunk_ids in ids_list:
+                for pair in zip(chunk_ids, chunk_ids[1:]):
+                    stats[pair] += 1
+            
+            if not stats:
+                break 
 
-        merges_applied = []
-        for m in range(num_merges):
-            pairs = Counter()
-            a = arr
-            for i in range(a.shape[0] - 1):
-                pairs[(int(a[i]), int(a[i+1]))] += 1
+            top_pair = max(stats, key=stats.get)
+            
+            idx = 256 + i
+            self.merges[top_pair] = idx
+            
+            self.vocab[idx] = self.vocab[top_pair[0]] + self.vocab[top_pair[1]]
+            
+            ids_list = [self._merge_chunk(chunk, top_pair, idx) for chunk in ids_list]
+            
+            if verbose and (i + 1) % 100 == 0:
+                print(f"Merge {i+1}/{num_merges}: {top_pair} -> {idx} ({self.vocab[idx]})")
 
-            if not pairs:
-                break
+        self.vocab_size_val = 256 + len(self.merges)
+        print(f"Training complete. Final Vocab Size: {self.vocab_size_val}")
 
-            (p1, p2), freq = pairs.most_common(1)[0]
-            new_id = self._next_id
-            self._next_id += 1
-
-            self.merges[(p1, p2)] = new_id
-            merges_applied.append((p1, p2, new_id))
-            arr = _apply_merge_numba(arr, p1, p2, new_id)
-            self.vocab[new_id] = self.vocab[p1] + self.vocab[p2]
-
-            if verbose and ((m + 1) % 50 == 0 or (m+1) == num_merges):
-                print(f"[BPE] Applied {m+1}/{num_merges} merges; most common pair {p1},{p2} freq={freq}")
-
-            if arr.shape[0] < 2:
-                break
-
-        self._merges_seq = merges_applied
+    def _merge_chunk(self, ids: List[int], pair: Tuple[int, int], idx: int) -> List[int]:
+        """
+        Replaces all occurrences of 'pair' with 'idx' in a single list of integers.
+        """
+        newids = []
+        i = 0
+        while i < len(ids):
+            if i < len(ids) - 1 and ids[i] == pair[0] and ids[i+1] == pair[1]:
+                newids.append(idx)
+                i += 2
+            else:
+                newids.append(ids[i])
+                i += 1
+        return newids
 
     def tokenize(self, text: str) -> List[int]:
         """
-        Encode a single string into token IDs (list[int]).
-        Uses byte-level input and applies merges in the order learned during training.
+        Encodes a string into a list of token IDs using the trained merges.
         """
-        b = text.encode("utf-8")
-        arr = np.frombuffer(b, dtype=np.uint8).astype(np.int64)
-
-        if self._merges_seq:
-            arr = _apply_merges_seq(arr, self._merges_seq)
-
-        return arr.tolist()
+        compiled_pattern = re.compile(GPT4_SPLIT_PATTERN)
+        text_chunks = re.findall(compiled_pattern, text)
+        
+        final_ids = []
+        for chunk in text_chunks:
+            chunk_ids = list(chunk.encode("utf-8"))
+            
+            # Apply merges in order
+            while len(chunk_ids) >= 2:
+                stats = defaultdict(int)
+                for pair in zip(chunk_ids, chunk_ids[1:]):
+                    stats[pair] += 1
+                
+                pair_to_merge = None
+                min_idx = float("inf")
+                
+                for pair in stats:
+                    if pair in self.merges:
+                        if self.merges[pair] < min_idx:
+                            min_idx = self.merges[pair]
+                            pair_to_merge = pair
+                
+                if pair_to_merge is None:
+                    break 
+                
+                chunk_ids = self._merge_chunk(chunk_ids, pair_to_merge, min_idx)
+            
+            final_ids.extend(chunk_ids)
+            
+        return final_ids
 
     def tokenize_batch(self, texts: List[str]) -> List[List[int]]:
         return [self.tokenize(t) for t in texts]
 
     def vocab_size(self) -> int:
-        return len(self.vocab)
+        return self.vocab_size_val
 
-    def decode(self, ids: List[int]) -> str:
-        parts = []
-        for idx in ids:
-            parts.append(self.vocab.get(idx, b"?"))
-        return b"".join(parts).decode("utf-8", errors="replace")
+    def save(self, path: str):
+        """Save the tokenizer merges to a JSON file."""
+        export_merges = [[p[0], p[1], idx] for p, idx in self.merges.items()]
+        data = {
+            "vocab_size": self.vocab_size_val,
+            "merges": export_merges
+        }
+        with open(path, "w") as f:
+            json.dump(data, f)
+        print(f"Tokenizer saved to {path}")
 
-    def save_merges(self, path: str) -> None:
-        with open(path, "w", encoding="utf-8") as f:
-            for (p1, p2, new_id) in self._merges_seq:
-                f.write(f"{p1} {p2} {new_id}\n")
-
-    def load_merges(self, path: str) -> None:
-        merges = []
-        self.merges = {}
+    def load(self, path: str):
+        """Load the tokenizer merges from a JSON file."""
+        with open(path, "r") as f:
+            data = json.load(f)
+        
+        self.vocab_size_val = data["vocab_size"]
+        self.merges = {tuple(item[:2]): item[2] for item in data["merges"]}
+        
         self.vocab = {i: bytes([i]) for i in range(256)}
-        self._next_id = 256
-
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                p1_s, p2_s, new_s = line.strip().split()
-                p1, p2, new_id = int(p1_s), int(p2_s), int(new_s)
-                self.merges[(p1, p2)] = new_id
-                self.vocab[new_id] = self.vocab[p1] + self.vocab[p2]
-                merges.append((p1, p2, new_id))
-                self._next_id = max(self._next_id, new_id + 1)
-
-        self._merges_seq = merges
+        sorted_merges = sorted(self.merges.items(), key=lambda x: x[1])
+        for (p0, p1), idx in sorted_merges:
+            self.vocab[idx] = self.vocab[p0] + self.vocab[p1]
+        print(f"Tokenizer loaded from {path}")
